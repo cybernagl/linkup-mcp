@@ -20,6 +20,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -27,7 +28,7 @@ from typing import Annotated, Any, Literal
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import Tool, ToolAnnotations
 from pydantic import Field
 
 try:
@@ -76,16 +77,48 @@ def fetch_price(mode: str, render_js: bool, has_schema: bool) -> float:
 INSTRUCTIONS = f"""Linkup web access (docs read {DOCS_READ_DATE}; prices in USD per call, billed from a prepaid balance).
 
 Routing:
-- Known URL, want the page: linkup-fetch (0.001 to 0.011). Add renderJs for JavaScript sites, mode "pro" for hard pages, schema for typed JSON from that one page.
-- Question answerable by a web search: linkup-search. depth "fast" (about 1 s, keyword-only, 0.005) is the default; "standard" (1 to 3 s, one agentic pass, follows instructions, can scrape one URL in the query); "deep" (5 to 30 s, several iterations, sequential instructions, 0.05 to 0.055). outputType "searchResults" when you will reason over the sources yourself, "sourcedAnswer" for a cited answer, "structured" with a JSON schema for typed output.
+- Known URL, want the page: linkup-fetch (0.001 to 0.011). Add render_js for JavaScript sites, mode "pro" for hard pages, schema for typed JSON from that one page.
+- Question answerable by a web search: linkup-search. depth "fast" (about 1 s, keyword-only, 0.005) is the default; "standard" (1 to 3 s, one agentic pass, follows instructions, can scrape one URL in the query); "deep" (5 to 30 s, several iterations, sequential instructions, 0.05 to 0.055). output_type "searchResults" when you will reason over the sources yourself, "sourcedAnswer" for a cited answer, "structured" with a JSON schema for typed output.
 - Multi-source synthesis that one search cannot resolve: linkup-research, asynchronous, 2 to 20 minutes, 0.25 (S) to 2.50 (XL) per task, default L = 1.50. Set mode explicitly (answer, investigate, research). Then linkup-wait-research or linkup-get-research. Never re-create a task to retry a wait; every creation is billed.
 - Bulk or mixed work (up to 100 items per batch, same price per item): linkup-tasks-create, then linkup-tasks-list or linkup-tasks-get.
 - Balance: linkup-credits-balance. A 429 means rate limit or no credit left.
 - Reference: linkup-guide (topics) and the resources linkup://guide and linkup://openapi.json.
 
-Rules from Linkup's docs: put date ranges in fromDate/toDate, not in the query; prefer a few trusted includeDomains; keep structured schemas flat; poll research at 2 s backing off to 10 s, never above 1 request per second; failed calls are not billed. Extract and Rewind are closed betas (403 unless enabled for the organisation)."""
+Rules from Linkup's docs: put date ranges in from_date/to_date, not in the query; prefer a few trusted include_domains; keep structured schemas flat; poll research at 2 s backing off to 10 s, never above 1 request per second; failed calls are not billed. Extract and Rewind are closed betas (403 unless enabled for the organisation).
 
-mcp = FastMCP(
+Tool parameters are snake_case (output_type, render_js, from_date). A call with an unknown parameter name fails and sends no request. Only the input objects of linkup-tasks-create take the API's camelCase field names."""
+
+
+class _StrictFastMCP(FastMCP):
+    """FastMCP that rejects argument names which a tool does not declare.
+
+    FastMCP drops unknown arguments without an error, so a misspelt parameter such as
+    outputType would run a paid call with the default value. This subclass fails the call first.
+    """
+
+    _valid_parameters: dict[str, set[str]] | None = None
+
+    async def list_tools(self) -> list[Tool]:
+        tools = await super().list_tools()
+        return [t.model_copy(update={"inputSchema": {**t.inputSchema, "additionalProperties": False}}) for t in tools]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None) -> Any:
+        if self._valid_parameters is None:
+            self._valid_parameters = {t.name: set(t.inputSchema.get("properties", {})) for t in await self.list_tools()}
+        valid = self._valid_parameters.get(name)
+        unknown = sorted(set(arguments or {}) - valid) if valid is not None else []
+        if unknown:
+            items = []
+            for arg in unknown:
+                fix = re.sub(r"(?<!^)(?=[A-Z])", "_", arg).lower()
+                if fix not in valid and arg == "q":
+                    fix = "query"
+                items.append(f"{arg} (use {fix})" if fix != arg and fix in valid else arg)
+            raise ToolError(f"Unknown argument(s) for {name}: {', '.join(items)}. Valid parameters: {', '.join(sorted(valid)) or 'none'}. No request was sent to Linkup.")
+        return await super().call_tool(name, arguments)
+
+
+mcp = _StrictFastMCP(
     "linkup",
     instructions=INSTRUCTIONS,
     website_url="https://github.com/cybernagl/linkup-mcp",
@@ -1036,6 +1069,11 @@ Rate limits: 10 requests per second per organisation on search and fetch; pollin
 and research at most 1 request per second. Errors carry {{statusCode, error: {{code, message,
 details[]}}}}. Docs index: https://docs.linkup.so/llms.txt. OpenAPI: https://api.linkup.so/v1/openapi.json
 (snapshot in resource linkup://openapi.json).
+
+Parameter names: this guide names the REST API fields in camelCase. The tools take the same
+fields in snake_case (q is query, outputType is output_type, renderJs is render_js,
+structuredOutputSchema is structured_output_schema). The tools reject unknown parameter names.
+The input objects of linkup-tasks-create take the API field names unchanged.
 
 Choosing: a known URL -> fetch; a fact or a list of sources -> search (fast by default,
 standard for instructions or breadth, deep for multi-step); synthesis across many sources

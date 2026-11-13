@@ -347,6 +347,41 @@ async def run() -> None:
           f"row count after cap: returned={r.get('rows_returned')}, kept={len(kept)}, omitted={r.get('rows_omitted')}, {size(r)} chars")
     server._download_client = original_download_client
 
+    # Strict arguments: an unknown name fails before any request
+    requests = [0]
+
+    def counting_handler(request: httpx.Request) -> httpx.Response:
+        requests[0] += 1
+        return httpx.Response(200, json={"results": []})
+
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(counting_handler), base_url="https://mock/v1")
+
+    async def call_error(name: str, args: dict[str, Any]) -> str | None:
+        try:
+            await server.mcp.call_tool(name, args)
+        except server.ToolError as exc:
+            return str(exc)
+        return None
+
+    msg = await call_error("linkup-search", {"query": "x", "outputType": "structured"})
+    check(msg is not None and "outputType" in msg and "(use output_type)" in msg and "No request was sent to Linkup" in msg and requests[0] == 0,
+          f"unknown argument rejected with a hint, no request: {msg}")
+    msg = await call_error("linkup-search", {"q": "x"})
+    check(msg is not None and "q (use query)" in msg, f"q gets the hint query: {msg}")
+    msg = await call_error("linkup-search", {"query": "x", "fooBar": 1})
+    check(msg is not None and "fooBar" in msg and "(use" not in msg, f"no hint without a known correction: {msg}")
+    msg = await call_error("linkup-wait-research", {"id": "t1", "ctx": 1})
+    check(msg is not None and "ctx" in msg and "Valid parameters:" in msg, f"ctx is not accepted: {msg}")
+    msg = await call_error("linkup-credits-balance", {"x": 1})
+    check(msg is not None and "Valid parameters: none" in msg, f"tool without parameters: {msg}")
+    text = first_text(await server.mcp.call_tool("linkup-search", {"query": "x", "output_type": "searchResults"}))
+    check(requests[0] == 1 and isinstance(text, str), f"valid arguments reach the client: {requests[0]} request")
+    tools = await server.mcp.list_tools()
+    check(all(t.inputSchema.get("additionalProperties") is False for t in tools), "every tool schema has additionalProperties false")
+
+    # Texts use the tool parameter names
+    check(not any(w in server.INSTRUCTIONS for w in ("renderJs", "outputType", "fromDate", "toDate", "includeDomains")), "INSTRUCTIONS name no camelCase parameters")
+
 
 asyncio.run(run())
 print("RESULT:", "OK" if failures == 0 else f"{failures} failure(s)")

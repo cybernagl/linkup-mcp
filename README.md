@@ -42,11 +42,21 @@ Behaviour worth knowing:
 
 - Research tasks are created once and polled. `linkup-wait-research` returns after
   `max_wait_seconds` (default 600) with `done: false` if the task still runs and can be
-  called again with the same id. It never re-creates a task.
-- Every response is capped by `max_chars`. Truncation order: raw content and source snippets
-  first, then trailing sources, the answer or markdown last. `_truncated` and `_hint` say
-  when it happened. Research answers come back byte-identical to the API unless they alone
-  exceed the cap.
+  called again with the same id. It never re-creates a task. A network error, a timeout, an
+  HTTP 429 or an HTTP 5xx during the wait does not end the wait. The tool polls again until
+  `max_wait_seconds` and reports `transient_errors` and `last_error`.
+- Every tool that returns results, tasks, lists or rows takes `max_chars` and keeps its
+  response within it. The response is compact JSON. The cap applies to the text that is sent.
+  The order of cuts is: raw content and source snippets, then other long strings, then
+  trailing sources, results and images, then the answer or markdown, then trailing items of
+  other lists. A `<list>_omitted` counter gives the number of dropped items. `_truncated`
+  and `_hint` say when a cut happened. A research answer comes back byte-identical to the
+  API when the answer and the task envelope (a few hundred characters) fit in the cap. The
+  two create calls (`linkup-research`, `linkup-extract`), the balance and the guide have no
+  cap, because their responses are small.
+- Tool parameters are snake_case. A call with an unknown parameter name (for example
+  `outputType`) fails with an error that names the valid parameters. No request is sent to
+  Linkup.
 - `linkup-list-research` and `linkup-tasks-list` return an `output_preview` per task;
   `include_output: true` returns the full outputs.
 - Errors carry Linkup's status code, its error body, and a one-line hint (for example 429:
@@ -61,10 +71,14 @@ no checkout needed:
 uvx linkup-mcp
 ```
 
-Claude Code, user scope (the key goes into the env of the entry, never on the command line):
+Claude Code, user scope. The key is stored in the `env` of the entry, not in its `args`.
+`read -rs` keeps the key out of the shell history. The key is on the command line of the
+`claude` process only while the command runs.
 
 ```
-claude mcp add-json --scope user linkup '{"type":"stdio","command":"uvx","args":["linkup-mcp"],"env":{"LINKUP_API_KEY":"<key>"}}'
+read -rs LINKUP_API_KEY   # paste the key, then press Enter; nothing is shown
+claude mcp add-json --scope user linkup '{"type":"stdio","command":"uvx","args":["linkup-mcp"],"env":{"LINKUP_API_KEY":"'"$LINKUP_API_KEY"'"}}'
+unset LINKUP_API_KEY
 ```
 
 The current main branch instead of the release: replace `linkup-mcp` in `args` with
@@ -91,7 +105,7 @@ uv venv && uv pip install -e .
 ## Test
 
 ```
-.venv/bin/python tests/test_wait.py       # offline: wait loop, error mapping, truncation, list summaries
+.venv/bin/python tests/test_wait.py       # offline: wait loop, error mapping, size cap, argument checks, list summaries
 .venv/bin/python tests/selftest.py        # protocol checks, plus free live calls when LINKUP_API_KEY is set
 .venv/bin/python tests/selftest.py --paid # adds two fast searches and two fetches, about 0.014 USD
 ```

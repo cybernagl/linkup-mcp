@@ -94,6 +94,18 @@ async def main(argv: list[str]) -> int:
             if not r.isError:
                 failures += 1
 
+            # Unknown arguments are rejected locally and named in the error
+            r = await session.call_tool("linkup-guide", {"topic": "links", "bogusArg": 1})
+            print(f"unknown argument: isError={r.isError}: {text_of(r)[:90]}")
+            if not r.isError or "bogusArg" not in text_of(r):
+                failures += 1
+
+            # Every tool schema forbids additional properties
+            open_schemas = [t.name for t in tools.tools if (t.inputSchema or {}).get("additionalProperties") is not False]
+            print(f"additionalProperties false on every tool: {'yes' if not open_schemas else 'NO, open: ' + str(open_schemas)}")
+            if open_schemas:
+                failures += 1
+
             if not have_key:
                 print("LINKUP_API_KEY not set: skipping live calls")
                 return failures
@@ -173,9 +185,19 @@ async def main(argv: list[str]) -> int:
             import httpx  # local import: only needed here
             async with httpx.AsyncClient(base_url=env.get("LINKUP_BASE_URL", "https://api.linkup.so/v1"), headers={"Authorization": "Bearer " + env["LINKUP_API_KEY"]}, timeout=60) as raw:
                 for rid in ids:
-                    raw_task = (await raw.get(f"/research/{rid}")).json()
+                    await asyncio.sleep(1.1)  # at most one request per second to /research/{id}
+                    raw_response = await raw.get(f"/research/{rid}")
+                    if raw_response.status_code != 200:
+                        print(f"integrity {rid[:8]}...: not checked (raw GET returned HTTP {raw_response.status_code})")
+                        continue
+                    raw_task = raw_response.json()
+                    await asyncio.sleep(1.1)
                     r = await session.call_tool("linkup-get-research", {"id": rid})
                     body = text_of(r)
+                    if r.isError:
+                        print(f"integrity {rid[:8]}...: ERROR {body[:200]}")
+                        failures += 1
+                        continue
                     j = json.loads(body)
                     out = (j.get("task") or {}).get("output") or {}
                     raw_out = raw_task.get("output") or {}
