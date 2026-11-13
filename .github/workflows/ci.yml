@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install -e .
+
+      - name: Offline tests
+        run: .venv/bin/python tests/test_wait.py
+
+      - name: Protocol self-test without an API key
+        run: .venv/bin/python tests/selftest.py
+
+      - name: Build wheel and sdist
+        run: uv build
