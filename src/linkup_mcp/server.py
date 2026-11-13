@@ -16,6 +16,7 @@ Run: linkup-mcp   (stdio transport; or python -m linkup_mcp)
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -102,9 +103,30 @@ PAID = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=
 CREATES = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
 
 
-def tool(**kwargs: Any):
-    """mcp.tool with structured output off: one text block per result, not text plus a JSON copy."""
-    return mcp.tool(structured_output=False, **kwargs)
+def _dumps(obj: Any) -> str:
+    """Serialise to compact JSON with non-ASCII characters kept. The tools send this text, and the size cap measures it."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def tool(**options: Any):
+    """Register a tool with FastMCP and return the function unchanged.
+
+    FastMCP gets a wrapper that sends a dict result as the text of _dumps, the text that the
+    size cap measures. A str result goes out unchanged. Structured output is off: one text
+    block per result, not text plus a JSON copy. functools.wraps keeps the parameter schema
+    and the injection of ctx.
+    """
+
+    def register(fn: Any) -> Any:
+        @functools.wraps(fn)
+        async def send(*args: Any, **kwargs: Any) -> Any:
+            result = await fn(*args, **kwargs)
+            return result if isinstance(result, str) else _dumps(result)
+
+        mcp.tool(structured_output=False, **options)(send)
+        return fn
+
+    return register
 
 
 # --------------------------------------------------------------------------
@@ -209,122 +231,213 @@ def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
 TRUNCATE_FIRST = {"rawHtml", "rawContent", "snippet", "content", "favicon"}  # supporting material
 TRUNCATE_LAST = {"answer", "markdown", "output_text", "data"}  # the primary payload
 TRUNCATION_MARKER = " [truncated by the MCP server; raise max_chars for more]"
-PRUNE_LISTS = {"sources", "results", "images"}
+PRUNE_LISTS = {"sources", "results", "images"}  # supporting lists
+NEVER_CUT = {"url", "resultUrl"}  # a cut URL is a broken link
+CUT_HINT = "Output was cut to fit max_chars={max_chars}. Order of cuts: supporting strings, then trailing list items (the <name>_omitted counters give the numbers), the main text last. Call again with a larger max_chars to see more."
+RAW_HINT = "Output could not be cut to max_chars={max_chars} in a structured way. _raw_prefix holds the start of the JSON text. Call again with a larger max_chars."
+
+
+def _long_strings(obj: Any, tier: int, floor: int) -> list[tuple[int, Any, Any]]:
+    """Find the strings of one tier that are longer than floor, as (length, container, key).
+
+    The tier comes from the key of the string: 0 for TRUNCATE_FIRST, 2 for TRUNCATE_LAST,
+    1 for all other keys. A string directly in a list uses the key of the list. Every string
+    in a dict under the key "data" is tier 2, at any depth: that dict is the primary payload,
+    and its keys are field names from the schema of the caller. Strings under a key in
+    NEVER_CUT are not found.
+    """
+    found: list[tuple[int, Any, Any]] = []
+
+    def walk(node: Any, name: Any, payload: bool) -> None:
+        if isinstance(node, dict):
+            entries = [(k, v, k, payload or (k == "data" and isinstance(v, dict))) for k, v in node.items()]
+        elif isinstance(node, list):
+            entries = [(i, v, name, payload) for i, v in enumerate(node)]
+        else:
+            return
+        for key, value, own, in_payload in entries:
+            if not isinstance(value, str):
+                walk(value, own, in_payload)
+            elif len(value) > floor and own not in NEVER_CUT:
+                own_tier = 2 if in_payload or own in TRUNCATE_LAST else 0 if own in TRUNCATE_FIRST else 1
+                if own_tier == tier:
+                    found.append((len(value), node, key))
+
+    walk(obj, None, False)
+    return found
+
+
+def _cut_strings(obj: Any, tier: int, floor: int, over: int) -> bool:
+    """Cut the longest strings of one tier to a common length, not below floor, to save over characters.
+
+    Returns True when a string was cut.
+    """
+    group = _long_strings(obj, tier, floor)
+    if not group:
+        return False
+    texts = [(container[key], len(_dumps(container[key]))) for _, container, key in group]
+
+    def saved(level: int) -> int:
+        # A cut string keeps level characters. Measure the JSON text of the kept start,
+        # because escapes make it longer than its number of characters.
+        keep = level - len(TRUNCATION_MARKER)
+        return sum(full - len(_dumps(text[:keep])) - len(TRUNCATION_MARKER) for text, full in texts if len(text) > level)
+
+    if saved(floor) < over:
+        level = floor
+    else:
+        lo, hi = floor, max(length for length, _, _ in group)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if saved(mid) >= over:
+                lo = mid
+            else:
+                hi = mid
+        level = lo
+    for length, container, key in group:
+        if length > level:
+            container[key] = container[key][: level - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+    return True
+
+
+def _dict_lists(obj: Any) -> list[tuple[dict[str, Any], str]]:
+    """Find every list that is the direct value of a dict key, as (dict, key). An outer list comes before the lists in it."""
+    found: list[tuple[dict[str, Any], str]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, list):
+                    found.append((node, k))
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+    return found
+
+
+def _drop_trailing(container: dict[str, Any], key: str, keep: int, need: int) -> tuple[int, list[Any]]:
+    """Drop trailing items of container[key] until the JSON text is need characters shorter or keep items are left.
+
+    Adds the number of dropped items to container["<key>_omitted"]. The saving is calculated
+    from the items, without a serialisation of the whole object: an item saves its JSON text
+    and one comma (the last item of the list has no comma to save), and a new counter costs
+    ,"<key>_omitted":<n>. Drops nothing when that saves nothing. Returns the number of
+    characters saved and the dropped items.
+    """
+    items = container[key]
+    counter = f"{key}_omitted"
+    before = container.get(counter, 0)
+    if not isinstance(before, int):
+        return 0, []
+    counter_base = -len(str(before)) if counter in container else len(_dumps(counter)) + 2
+    removed = dropped = saved = 0
+    while len(items) - dropped > keep and saved < need:
+        dropped += 1
+        removed += len(_dumps(items[-dropped])) + 1
+        last_comma = 1 if dropped == len(items) else 0
+        saved = removed - last_comma - (counter_base + len(str(before + dropped)))
+    if saved <= 0:
+        return 0, []
+    tail = items[-dropped:]
+    del items[-dropped:]
+    container[counter] = before + dropped
+    return saved, tail
+
+
+def _prune_lists(targets: list[tuple[dict[str, Any], str]], keep: int, over: int) -> bool:
+    """Drop trailing items of the target lists, one list after the other, to save over characters.
+
+    Skips a list that was in an item dropped before: it is no longer part of the object.
+    Returns True when an item was dropped.
+    """
+    detached: set[int] = set()
+    changed = False
+    for container, key in targets:
+        if over <= 0:
+            break
+        if id(container) in detached:
+            continue
+        saved, dropped = _drop_trailing(container, key, keep, over)
+        over -= saved
+        changed = changed or bool(dropped)
+        detached.update(id(inner) for inner, _ in _dict_lists(dropped))
+    return changed
+
+
+def _raw_fallback(text: str, budget: int, max_chars: int) -> dict[str, Any]:
+    """Wrap the longest prefix of a JSON text for which the wrapper fits the budget."""
+    hint = RAW_HINT.format(max_chars=max_chars)
+    lo, hi = 0, min(len(text), budget)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        # Measure the wrapper, not the prefix: JSON escapes the quotes and backslashes in it.
+        if len(_dumps({"_truncated": True, "_hint": hint, "_raw_prefix": text[:mid]})) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return {"_truncated": True, "_hint": hint, "_raw_prefix": text[:lo]}
 
 
 def _shrink(obj: Any, budget: int) -> tuple[Any, bool]:
-    """Truncate string values until the JSON serialisation fits the budget.
+    """Cut the object until its JSON text (_dumps) fits the budget.
 
-    Strings are cut in tiers: supporting material first (raw content, source snippets,
-    result content), then everything else, and the primary payload (answer, markdown) only
-    when nothing else is left to cut. Within a tier the longest strings are cut down to a
-    common level, so a research answer survives intact unless it alone exceeds the budget.
+    The steps run in this order and stop when the object fits:
+    1. Supporting strings (raw content, source snippets, result content) are cut to a common length, not below 200 characters
+    2. All other strings, except the primary payload, are cut the same way
+    3. Supporting lists (sources, results, images) lose trailing items, down to 5 items each
+    4. Supporting lists lose trailing items, down to 0 items
+    5. The primary payload (answer, markdown, output_text, every string in a data dict) is cut to a common length, not below 1000 characters
+    6. Every other list under a dict key loses trailing items, the largest list first, down to 1 item each
+    7. If the object still does not fit, the result is a new dict with _truncated, _hint and _raw_prefix (the start of the JSON text)
+
+    A cut string ends with TRUNCATION_MARKER. A URL is never cut. A <key>_omitted counter
+    next to a list gives the number of dropped items. Steps 1 to 6 change the object in
+    place. Step 7 returns a new dict, so callers must use the returned object.
     Returns (object, truncated).
     """
-    def size() -> int:
-        return len(json.dumps(obj, ensure_ascii=False))
-
-    if size() <= budget:
+    over = len(_dumps(obj)) - budget
+    if over <= 0:
         return obj, False
-    truncated = False
 
-    def tier_of(name: Any) -> int:
-        if name in TRUNCATE_FIRST:
-            return 0
-        if name in TRUNCATE_LAST:
-            return 2
-        return 1
+    def supporting_lists() -> list[tuple[dict[str, Any], str]]:
+        return [(c, k) for c, k in _dict_lists(obj) if k in PRUNE_LISTS]
 
-    def collect_strings(tier: int) -> list[tuple[int, Any, Any]]:
-        found: list[tuple[int, Any, Any]] = []  # (length, container, key)
+    def other_lists_largest_first() -> list[tuple[dict[str, Any], str]]:
+        others = [(c, k) for c, k in _dict_lists(obj) if k not in PRUNE_LISTS]
+        return sorted(others, key=lambda t: len(_dumps(t[0][t[1]])), reverse=True)
 
-        def walk(node: Any, name: Any = None) -> None:
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    if isinstance(v, str):
-                        if len(v) > 200 and tier_of(k) == tier:
-                            found.append((len(v), node, k))
-                    else:
-                        walk(v, k)
-            elif isinstance(node, list):
-                for i, v in enumerate(node):
-                    if isinstance(v, str):
-                        if len(v) > 200 and tier_of(name) == tier:
-                            found.append((len(v), node, i))
-                    else:
-                        walk(v, name)
-
-        walk(obj)
-        return found
-
-    def cut_tier(tier: int, floor: int) -> None:
-        nonlocal truncated
-        excess = size() - budget
-        group = collect_strings(tier)
-        if excess <= 0 or not group:
-            return
-        lengths = [g[0] for g in group]
-
-        def saved(level: int) -> int:
-            cuts = [l for l in lengths if l > level]
-            return sum(l - level for l in cuts) - len(cuts) * len(TRUNCATION_MARKER)
-
-        if saved(floor) < excess:
-            level = floor
-        else:
-            lo, hi = floor, max(lengths)
-            while hi - lo > 1:
-                mid = (lo + hi) // 2
-                if saved(mid) >= excess:
-                    lo = mid
-                else:
-                    hi = mid
-            level = lo
-        for length, container, key in group:
-            if length > level:
-                container[key] = container[key][: max(0, level - len(TRUNCATION_MARKER))] + TRUNCATION_MARKER
-                truncated = True
-
-    def prune_lists() -> None:
-        """Drop trailing items of long supporting lists (sources, results, images), keeping at least 5."""
-        nonlocal truncated
-        targets: list[tuple[dict[str, Any], str]] = []
-
-        def walk(node: Any) -> None:
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    if isinstance(v, list) and k in PRUNE_LISTS and len(v) > 5:
-                        targets.append((node, k))
-                    else:
-                        walk(v)
-            elif isinstance(node, list):
-                for v in node:
-                    walk(v)
-
-        walk(obj)
-        for container, key in targets:
-            while size() > budget and len(container[key]) > 5:
-                container[key].pop()
-                container[key + "_omitted"] = container.get(key + "_omitted", 0) + 1
-                truncated = True
-            if size() <= budget:
-                return
-
-    cut_tier(0, 200)  # raw content, snippets, result content
-    if size() > budget:
-        cut_tier(1, 200)  # other strings
-    if size() > budget:
-        prune_lists()  # fewer sources before a shorter answer
-    if size() > budget:
-        cut_tier(2, 1000)  # the answer or markdown itself, last resort
-    return obj, truncated
+    steps = (
+        lambda need: _cut_strings(obj, 0, 200, need),
+        lambda need: _cut_strings(obj, 1, 200, need),
+        lambda need: _prune_lists(supporting_lists(), 5, need),  # fewer sources before a shorter answer
+        lambda need: _prune_lists(supporting_lists(), 0, need),
+        lambda need: _cut_strings(obj, 2, 1000, need),
+        lambda need: _prune_lists(other_lists_largest_first(), 1, need),
+    )
+    for step in steps:
+        if step(over):
+            over = len(_dumps(obj)) - budget
+            if over <= 0:
+                return obj, True
+    return _raw_fallback(_dumps(obj), budget, budget), True
 
 
 def _finish(obj: dict[str, Any], max_chars: int) -> dict[str, Any]:
-    out, truncated = _shrink(obj, max(2000, max_chars))
-    if truncated:
-        out["_truncated"] = True
-        out["_hint"] = f"Output was cut to fit max_chars={max_chars}: supporting strings first, then trailing sources, the main text last. Call again with a larger max_chars to see more."
+    """Fit obj into max_chars (at least 2000) characters of JSON text. The _truncated and _hint keys count toward the cap."""
+    cap = max(2000, max_chars)
+    if len(_dumps(obj)) <= cap:
+        return obj
+    marks = {"_truncated": True, "_hint": CUT_HINT.format(max_chars=max_chars)}
+    # In the dict, the marks cost their JSON text without the braces, plus one comma.
+    out, _ = _shrink(obj, cap - (len(_dumps(marks)) - 1))
+    if out is not obj:
+        # Terminal fallback. Steps 1 to 6 changed obj in place: wrap its JSON text again,
+        # for the full cap and with the max_chars of the caller in the hint.
+        return _raw_fallback(_dumps(obj), cap, max_chars)
+    out.update(marks)
     return out
 
 
