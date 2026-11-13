@@ -134,6 +134,15 @@ async def run() -> None:
     check(data.get("summary") == "s" * 6000 and data.get("content") == "c" * 300, "structured search: both data strings kept whole")
     check(size(out) <= 8000, f"structured search: fits 8000: {size(out)} chars")
 
+    # A list in a data dict is payload, whatever its key: the outer sources go first
+    nested = {"result": {"data": {"summary": "s" * 3000, "results": [{"title": f"r{i}", "text": "t" * 170} for i in range(30)]},
+                         "sources": [{"name": f"n{i}", "url": f"https://example.com/{i}", "snippet": "p" * 900} for i in range(20)]}}
+    out = server._finish(copy.deepcopy(nested), 12000)
+    res = out.get("result", {})
+    data = res.get("data", {})
+    check(data.get("results") == nested["result"]["data"]["results"] and "results_omitted" not in data, f"data.results kept whole: {len(data.get('results', []))} items, results_omitted={data.get('results_omitted')}")
+    check(len(res.get("sources", [])) < 20 and size(out) <= 12000, f"outer sources pruned instead: {len(res.get('sources', []))} kept, {size(out)} chars")
+
     # URLs are never cut, even when they are long and other strings are cut
     sourced = {"result": {"answer": "a" * 2000, "sources": [{"name": f"n{i}", "url": f"https://example.com/{'u' * 277}{i:03d}", "snippet": "p" * 1000} for i in range(10)]},
                "cost_usd_estimate": 0.006, "depth": "standard", "outputType": "sourcedAnswer"}

@@ -300,21 +300,26 @@ def _cut_strings(obj: Any, tier: int, floor: int, over: int) -> bool:
     return True
 
 
-def _dict_lists(obj: Any) -> list[tuple[dict[str, Any], str]]:
-    """Find every list that is the direct value of a dict key, as (dict, key). An outer list comes before the lists in it."""
-    found: list[tuple[dict[str, Any], str]] = []
+def _dict_lists(obj: Any) -> list[tuple[dict[str, Any], str, bool]]:
+    """Find every list that is the direct value of a dict key, as (dict, key, in_payload).
 
-    def walk(node: Any) -> None:
+    in_payload is True for a list in a dict under the key "data", at any depth: that dict is
+    the primary payload, and its keys are field names from the schema of the caller. An
+    outer list comes before the lists in it.
+    """
+    found: list[tuple[dict[str, Any], str, bool]] = []
+
+    def walk(node: Any, payload: bool) -> None:
         if isinstance(node, dict):
             for k, v in node.items():
                 if isinstance(v, list):
-                    found.append((node, k))
-                walk(v)
+                    found.append((node, k, payload))
+                walk(v, payload or (k == "data" and isinstance(v, dict)))
         elif isinstance(node, list):
             for v in node:
-                walk(v)
+                walk(v, payload)
 
-    walk(obj)
+    walk(obj, False)
     return found
 
 
@@ -363,7 +368,7 @@ def _prune_lists(targets: list[tuple[dict[str, Any], str]], keep: int, over: int
         saved, dropped = _drop_trailing(container, key, keep, over)
         over -= saved
         changed = changed or bool(dropped)
-        detached.update(id(inner) for inner, _ in _dict_lists(dropped))
+        detached.update(id(inner) for inner, _, _ in _dict_lists(dropped))
     return changed
 
 
@@ -387,7 +392,7 @@ def _shrink(obj: Any, budget: int) -> tuple[Any, bool]:
     The steps run in this order and stop when the object fits:
     1. Supporting strings (raw content, source snippets, result content) are cut to a common length, not below 200 characters
     2. All other strings, except the primary payload, are cut the same way
-    3. Supporting lists (sources, results, images) lose trailing items, down to 5 items each
+    3. Supporting lists (sources, results, images, but not in a data dict) lose trailing items, down to 5 items each
     4. Supporting lists lose trailing items, down to 0 items
     5. The primary payload (answer, markdown, output_text, every string in a data dict) is cut to a common length, not below 1000 characters
     6. Every other list under a dict key loses trailing items, the largest list first, down to 1 item each
@@ -403,10 +408,10 @@ def _shrink(obj: Any, budget: int) -> tuple[Any, bool]:
         return obj, False
 
     def supporting_lists() -> list[tuple[dict[str, Any], str]]:
-        return [(c, k) for c, k in _dict_lists(obj) if k in PRUNE_LISTS]
+        return [(c, k) for c, k, in_payload in _dict_lists(obj) if k in PRUNE_LISTS and not in_payload]
 
     def other_lists_largest_first() -> list[tuple[dict[str, Any], str]]:
-        others = [(c, k) for c, k in _dict_lists(obj) if k not in PRUNE_LISTS]
+        others = [(c, k) for c, k, in_payload in _dict_lists(obj) if k not in PRUNE_LISTS or in_payload]
         return sorted(others, key=lambda t: len(_dumps(t[0][t[1]])), reverse=True)
 
     steps = (
