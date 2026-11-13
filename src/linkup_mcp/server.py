@@ -29,6 +29,14 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _package_version
+
+    __version__ = _package_version("linkup-mcp")
+except PackageNotFoundError:  # running from a plain source tree, not installed
+    __version__ = "0+unknown"
+
 DOCS_READ_DATE = "2026-11-13"
 HERE = Path(__file__).resolve().parent
 OPENAPI_SNAPSHOT = HERE / "openapi.json"
@@ -76,7 +84,15 @@ Routing:
 
 Rules from Linkup's docs: put date ranges in fromDate/toDate, not in the query; prefer a few trusted includeDomains; keep structured schemas flat; poll research at 2 s backing off to 10 s, never above 1 request per second; failed calls are not billed. Extract and Rewind are closed betas (403 unless enabled for the organisation)."""
 
-mcp = FastMCP("linkup", instructions=INSTRUCTIONS, log_level="WARNING")
+mcp = FastMCP(
+    "linkup",
+    instructions=INSTRUCTIONS,
+    website_url="https://github.com/cybernagl/linkup-mcp",
+    log_level="WARNING",
+)
+# FastMCP (mcp 1.x) has no version parameter and reports the SDK's version in the
+# initialize response; the low-level server underneath does take one.
+mcp._mcp_server.version = __version__
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 RO = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)

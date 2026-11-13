@@ -14,6 +14,7 @@ The key is never printed.
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import os
 import sys
@@ -53,6 +54,10 @@ async def main(argv: list[str]) -> int:
             init = await session.initialize()
             print(f"initialize: server {init.serverInfo.name} {init.serverInfo.version}, protocol {init.protocolVersion}")
             print(f"instructions: {len(init.instructions or '')} chars")
+            expected_version = importlib.metadata.version("linkup-mcp")
+            if init.serverInfo.version != expected_version:
+                print(f"FAIL serverInfo.version is {init.serverInfo.version!r}, package version is {expected_version!r}")
+                failures += 1
 
             tools = await session.list_tools()
             names = {t.name for t in tools.tools}

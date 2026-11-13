@@ -1,6 +1,6 @@
 [project]
 name = "linkup-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for the whole Linkup web API: search, fetch, research, batch tasks, credits, extract and rewind, with the documentation built in"
 readme = "README.md"
 requires-python = ">=3.11"
