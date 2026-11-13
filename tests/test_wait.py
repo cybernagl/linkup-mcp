@@ -45,6 +45,24 @@ def make_client(statuses: list[str], answer: str = "A" * 50) -> tuple[httpx.Asyn
     return client, calls
 
 
+def make_seq_client(entries: list[Any]) -> tuple[httpx.AsyncClient, list[int]]:
+    """Plays one entry per request, then repeats the last. An entry is a task status (str), an HTTP error status (int) or an exception to raise."""
+    calls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        entry = entries[min(calls[0], len(entries) - 1)]
+        calls[0] += 1
+        if isinstance(entry, Exception):
+            raise entry
+        if isinstance(entry, int):
+            return httpx.Response(entry, json={"statusCode": entry, "error": {"code": "E", "message": f"failure {entry}", "details": []}})
+        body = {"id": "t1", "type": "research", "status": entry, "input": {"q": "x", "outputType": "sourcedAnswer"},
+                "output": {"answer": "A" * 50, "sources": []} if entry == "completed" else None, "error": None}
+        return httpx.Response(200, json=body)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://mock/v1"), calls
+
+
 def first_text(result: Any) -> str:
     """Text of the first content block from mcp.call_tool (a list of blocks, or a tuple that starts with it)."""
     blocks = result[0] if isinstance(result, tuple) else result
@@ -92,6 +110,7 @@ async def run() -> None:
         check(False, "429 raises ToolError")
     except server.ToolError as exc:
         check("429" in str(exc) and "slow down" in str(exc) and "balance" in str(exc), f"429 mapped with hint: {str(exc)[:120]}")
+        check(isinstance(exc, server.LinkupError) and exc.status == 429 and exc.transient is True, "429 raises LinkupError with status 429, transient")
 
     # One serialisation: compact separators, non-ASCII kept
     check(hasattr(server, "_dumps") and server._dumps({"a": [1, "ü"], "b": None}) == '{"a":[1,"ü"],"b":null}', "_dumps is compact JSON with non-ASCII kept")
@@ -223,6 +242,110 @@ async def run() -> None:
     check("output" not in s["data"][0] and s["data"][0]["output_preview"]["answer_chars"] == 11 and s["data"][1]["output_preview"] is None, "list summary replaces outputs")
     s2 = server._summarize_tasks(json.loads(json.dumps(data)), True)
     check("output" in s2["data"][0], "include_output keeps outputs")
+
+    # Wait survives transient errors
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_seq_client(["processing", 504, 429, httpx.ConnectError("down"), "completed"])
+    r = await server.linkup_wait_research("t1", 240, 80000, None)
+    check(r["done"] is True and r["polls"] == 5 and r["transient_errors"] == 3, f"wait survives 504, 429, ConnectError: polls={r.get('polls')}, transient_errors={r.get('transient_errors')}")
+
+    # A clean wait has no transient_errors key
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_seq_client(["completed"])
+    r = await server.linkup_wait_research("t1", 240, 80000, None)
+    check(r["done"] is True and "transient_errors" not in r, "clean wait has no transient_errors")
+
+    # Wait gives up cleanly when every poll fails
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_seq_client([500])
+    r = await server.linkup_wait_research("t1", 20, 80000, None)
+    check(r["done"] is False and r["task"] is None and "500" in r["last_error"] and r["id"] == "t1", f"every poll 500: done={r.get('done')}, task={r.get('task')}")
+    check(r["transient_errors"] == r["polls"] == calls[0] and r["next"].startswith("No poll succeeded"), f"failed polls counted: polls={r.get('polls')}, requests={calls[0]}")
+    check(clock[0] <= 20, f"every poll 500: clock {clock[0]} s")
+
+    # done false after a successful poll then an error keeps the last task state
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_seq_client(["processing", 503])
+    r = await server.linkup_wait_research("t1", 20, 80000, None)
+    check(r["done"] is False and r["task"]["status"] == "processing" and r["transient_errors"] >= 1 and r["next"].startswith("Still running"), "error after a good poll keeps the last task")
+
+    # Wait fails fast on a non-transient error
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_seq_client([404])
+    try:
+        await server.linkup_wait_research("t1", 240, 80000, None)
+        check(False, "404 raises ToolError")
+    except server.ToolError as exc:
+        check(calls[0] == 1 and isinstance(exc, server.LinkupError) and exc.status == 404 and exc.transient is False, f"404 fails fast after {calls[0]} request")
+
+    # A non-transient error after transient ones is raised
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_seq_client([502, 401])
+    try:
+        await server.linkup_wait_research("t1", 240, 80000, None)
+        check(False, "401 after 502 raises ToolError")
+    except server.ToolError:
+        check(calls[0] == 2, f"401 after 502 raised after {calls[0]} requests")
+
+    # Network errors have no status
+    server._client, calls = make_seq_client([httpx.ConnectError("down")])
+    try:
+        await server.linkup_get_research("t1", 5000)
+        check(False, "ConnectError raises LinkupError")
+    except server.LinkupError as exc:
+        check(exc.status is None and exc.transient is True, "network error: status None, transient")
+
+    # done false is capped
+    sleeps.clear(); clock[0] = 0.0
+    server._client, calls = make_client(["processing"])
+    big_task = {"id": "t1", "type": "research", "status": "processing", "input": {"q": "q" * 100000, "outputType": "sourcedAnswer"}, "output": None, "error": None}
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=big_task)), base_url="https://mock/v1")
+    r = await server.linkup_wait_research("t1", 20, 5000, None)
+    check(size(r) <= 5000, f"done false held to 5000: {size(r)} chars")
+
+    # Extract paths hold the cap
+    big_extract = {"id": "e1", "status": "completed", "input": {"q": "q" * 50000, "url": "https://example.com"}, "output": {"resultUrl": "https://x/r", "creditsUsed": 2.5}}
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=big_extract)), base_url="https://mock/v1")
+    r = await server.linkup_get_extract("e1", 5000)
+    check(size(r) <= 5000, f"linkup-get-extract held to 5000: {size(r)} chars")
+
+    page = {"data": [{"id": str(i), "status": "completed", "input": {"q": "q" * 500}, "output": {"rows": ["r" * 100] * 50}} for i in range(100)], "metadata": {"page": 1}}
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=page)), base_url="https://mock/v1")
+    r = await server.linkup_list_extract(1, 100, None, "desc", False, 5000)
+    first = r.get("result", {}).get("data", [{}])[0]
+    check(size(r) <= 5000, f"linkup-list-extract held to 5000: {size(r)} chars")
+    check("output_preview" in first and "output" not in first, "linkup-list-extract gives output_preview in place of output")
+
+    submitted = [{"id": f"t{i}", "type": "search", "status": "pending", "input": {"q": "q" * 400}, "output": None} for i in range(100)]
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=submitted)), base_url="https://mock/v1")
+    r = await server.linkup_tasks_create([{"type": "search", "input": {"q": "x", "depth": "fast", "outputType": "searchResults"}}], False, 5000)
+    check(size(r) <= 5000, f"linkup-tasks-create held to 5000: {size(r)} chars")
+    r = await server.linkup_tasks_create([{"type": "search", "input": {"q": "x", "depth": "fast", "outputType": "searchResults"}}], True, 5000)
+    check(r.get("dry_run") is True, "linkup-tasks-create dry run unchanged")
+
+    # Redirects: the download client follows them
+    check(server._download_client().follow_redirects is True, "download client follows redirects")
+    original_download_client = server._download_client
+
+    def ndjson_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/first":
+            return httpx.Response(302, headers={"Location": "https://files.example/second"})
+        return httpx.Response(200, text='{"a":1}\n{"a":2}\n')
+
+    server._download_client = lambda **kw: original_download_client(transport=httpx.MockTransport(ndjson_handler), **kw)
+    task = {"id": "e1", "status": "completed", "output": {"resultUrl": "https://files.example/first", "creditsUsed": 2.5}}
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=task)), base_url="https://mock/v1")
+    r = await server.linkup_extract_download("e1", 200, 48000)
+    check(r.get("rows") == [{"a": 1}, {"a": 2}], f"download follows a 302: {r.get('rows')}")
+
+    # Row count matches the rows in the response after the cap
+    lines = "\n".join(json.dumps({"n": i, "text": "x" * 100}) for i in range(300))
+    server._download_client = lambda **kw: original_download_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, text=lines)), **kw)
+    r = await server.linkup_extract_download("e1", 200, 20000)
+    kept = r.get("rows", [])
+    check(r["rows_in_file"] == 300 and r["rows_returned"] == len(kept) and r["rows_omitted"] == 200 - len(kept) and size(r) <= 20000,
+          f"row count after cap: returned={r.get('rows_returned')}, kept={len(kept)}, omitted={r.get('rows_omitted')}, {size(r)} chars")
+    server._download_client = original_download_client
 
 
 asyncio.run(run())

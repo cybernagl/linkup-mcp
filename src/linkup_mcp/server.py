@@ -165,14 +165,23 @@ STATUS_HINTS = {
 }
 
 
+class LinkupError(ToolError):
+    """A failed Linkup call. status is the HTTP status, or None for a timeout or a network error."""
+
+    def __init__(self, message: str, *, status: int | None = None, transient: bool = False) -> None:
+        super().__init__(message)
+        self.status = status
+        self.transient = transient
+
+
 async def _request(method: str, path: str, *, json_body: Any = None, params: dict[str, Any] | None = None) -> Any:
     client = _get_client()
     try:
         resp = await client.request(method, path, json=json_body, params=params)
     except httpx.TimeoutException as exc:
-        raise ToolError(f"Timeout talking to Linkup ({exc}). Increase LINKUP_TIMEOUT or use a lower depth.") from exc
+        raise LinkupError(f"Timeout talking to Linkup ({exc}). Increase LINKUP_TIMEOUT or use a lower depth.", transient=True) from exc
     except httpx.HTTPError as exc:
-        raise ToolError(f"Network error talking to Linkup: {exc}") from exc
+        raise LinkupError(f"Network error talking to Linkup: {exc}", transient=True) from exc
     if resp.status_code >= 400:
         detail: Any
         try:
@@ -180,7 +189,11 @@ async def _request(method: str, path: str, *, json_body: Any = None, params: dic
         except ValueError:
             detail = resp.text[:2000]
         hint = STATUS_HINTS.get(resp.status_code, "")
-        raise ToolError(f"Linkup HTTP {resp.status_code}. {hint} Response: {json.dumps(detail)[:3000]}")
+        raise LinkupError(
+            f"Linkup HTTP {resp.status_code}. {hint} Response: {json.dumps(detail)[:3000]}",
+            status=resp.status_code,
+            transient=resp.status_code == 429 or resp.status_code >= 500,
+        )
     if resp.status_code == 204 or not resp.content:
         return None
     try:
@@ -671,14 +684,28 @@ async def linkup_wait_research(
     per second, and reports progress to the client. If max_wait_seconds elapses first, the
     task is returned with its current status (pending or processing) and done=false: call
     this tool again with the same id. Free; the task itself was billed when created.
+
+    A transient error on a poll (timeout, network error, HTTP 429 or 5xx) does not end the
+    wait. It is counted in transient_errors, and the wait goes on. Other errors are raised.
     """
     start = time.monotonic()
     interval = 2.0
     polls = 0
+    transient_errors = 0
+    last_error: str | None = None
+    data: Any = None
     while True:
-        data = await _request("GET", f"/research/{id}")
         polls += 1
-        status = data.get("status") if isinstance(data, dict) else None
+        try:
+            data = await _request("GET", f"/research/{id}")
+        except LinkupError as exc:
+            if not exc.transient:
+                raise
+            transient_errors += 1
+            last_error = str(exc)[:300]
+            status = f"error: {last_error[:80]}"
+        else:
+            status = data.get("status") if isinstance(data, dict) else None
         elapsed = time.monotonic() - start
         if ctx is not None:
             try:
@@ -686,15 +713,25 @@ async def linkup_wait_research(
             except Exception:
                 pass
         if status in ("completed", "failed"):
-            return _finish({"done": True, "waited_seconds": round(elapsed), "polls": polls, "task": data}, max_chars)
+            out: dict[str, Any] = {"done": True, "waited_seconds": round(elapsed), "polls": polls, "task": data}
+            if transient_errors:
+                out["transient_errors"] = transient_errors
+            return _finish(out, max_chars)
         if elapsed + interval > max_wait_seconds:
-            return {
+            out = {
                 "done": False,
+                "id": id,
                 "waited_seconds": round(elapsed),
                 "polls": polls,
                 "task": data,
-                "next": "Still running. Call linkup-wait-research again with the same id.",
+                "next": "Still running. Call linkup-wait-research again with the same id."
+                if data is not None
+                else "No poll succeeded (see last_error). The task is not lost and nothing was billed again. Call linkup-wait-research again with the same id.",
             }
+            if transient_errors:
+                out["transient_errors"] = transient_errors
+                out["last_error"] = last_error
+            return _finish(out, max_chars)
         await asyncio.sleep(interval)
         interval = min(interval * 2, 10.0)
 
@@ -739,6 +776,7 @@ def _estimate_task(task: dict[str, Any]) -> float | None:
 async def linkup_tasks_create(
     tasks: Annotated[list[dict[str, Any]], Field(description='1 to 100 items, each {"type": "search" | "fetch" | "research" | "extract", "input": {...}} where input has exactly the fields of the matching endpoint (camelCase: q, depth, outputType, url, renderJs, mode, reasoningDepth, includeDomains, fromDate ...). Types can be mixed. Tasks run in parallel; submit dependent work (fetch after search) as a second batch.', min_length=1, max_length=100)],
     dry_run: Annotated[bool, Field(description="true: validate and return the cost estimate without submitting anything.")] = False,
+    max_chars: Annotated[int, Field(description="Cap on the returned JSON size.", ge=2000)] = 40000,
 ) -> dict[str, Any]:
     """Create a batch of asynchronous tasks (POST /v1/tasks). Each task is billed exactly like the
     direct call: search 0.005 to 0.055, fetch 0.001 to 0.011, research 0.25 to 2.50 (100 research
@@ -777,7 +815,7 @@ async def linkup_tasks_create(
         return {"dry_run": True, "would_submit": len(norm), "cost_estimate": estimate}
     data = await _request("POST", "/tasks", json_body=norm)
     ids = [t.get("id") for t in data] if isinstance(data, list) else None
-    return {"submitted": len(norm), "cost_estimate": estimate, "task_ids": ids, "tasks": data}
+    return _finish({"submitted": len(norm), "cost_estimate": estimate, "task_ids": ids, "tasks": data}, max_chars)
 
 
 @tool(name="linkup-tasks-get", title="Linkup task (get)", annotations=RO)
@@ -852,12 +890,15 @@ async def linkup_extract(
 
 
 @tool(name="linkup-get-extract", title="Linkup extract task (get)", annotations=RO)
-async def linkup_get_extract(id: Annotated[str, Field(min_length=1)]) -> dict[str, Any]:
+async def linkup_get_extract(
+    id: Annotated[str, Field(min_length=1)],
+    max_chars: Annotated[int, Field(description="Cap on the returned JSON size.", ge=2000)] = 48000,
+) -> dict[str, Any]:
     """Read one extract task (GET /v1/extract/{id}). Free. When completed, output holds
     creditsUsed, rowsReturned and resultUrl (an NDJSON download link valid for 24 hours); the
     rows are not in the response."""
     data = await _request("GET", f"/extract/{id}")
-    return {"task": data}
+    return _finish({"task": data}, max_chars)
 
 
 @tool(name="linkup-list-extract", title="Linkup extract tasks (list)", annotations=RO)
@@ -866,10 +907,17 @@ async def linkup_list_extract(
     page_size: Annotated[int, Field(ge=1, le=100)] = 10,
     sort_by: Annotated[Literal["createdAt", "updatedAt"] | None, Field()] = None,
     sort_direction: Annotated[Literal["asc", "desc"] | None, Field()] = "desc",
+    include_output: Annotated[bool, Field(description="true: include each task's full output (large). Default: a short output_preview per task; read one task with linkup-get-extract.")] = False,
+    max_chars: Annotated[int, Field(description="Cap on the returned JSON size.", ge=2000)] = 40000,
 ) -> dict[str, Any]:
     """List extract tasks (GET /v1/extract). Free. Closed beta."""
     data = await _request("GET", "/extract", params=_page_params(page, page_size, sort_by, sort_direction))
-    return {"result": data}
+    return _finish({"result": _summarize_tasks(data, include_output)}, max_chars)
+
+
+def _download_client(**kwargs: Any) -> httpx.AsyncClient:
+    """Client for the plain file download of an extract result. It follows redirects."""
+    return httpx.AsyncClient(timeout=120.0, follow_redirects=True, **kwargs)
 
 
 @tool(name="linkup-extract-download", title="Linkup extract rows (download)", annotations=RO)
@@ -885,7 +933,7 @@ async def linkup_extract_download(
         raise ToolError(f"Extract task {id} is not completed or has no resultUrl: status={task.get('status') if isinstance(task, dict) else task}.")
     url = task["output"]["resultUrl"]
     try:
-        async with httpx.AsyncClient(timeout=120.0) as dl:
+        async with _download_client() as dl:
             resp = await dl.get(url)
             resp.raise_for_status()
     except httpx.HTTPError as exc:
@@ -902,7 +950,10 @@ async def linkup_extract_download(
                 rows.append(json.loads(line))
             except ValueError:
                 rows.append({"_unparsed": line})
-    return _finish({"id": id, "rows_in_file": total, "rows_returned": len(rows), "creditsUsed": task["output"].get("creditsUsed"), "rows": rows}, max_chars)
+    out = _finish({"id": id, "rows_in_file": total, "rows_returned": len(rows), "creditsUsed": task["output"].get("creditsUsed"), "rows": rows}, max_chars)
+    if isinstance(out.get("rows"), list):
+        out["rows_returned"] = len(out["rows"])
+    return out
 
 
 # --------------------------------------------------------------------------
