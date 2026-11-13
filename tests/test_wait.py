@@ -297,7 +297,6 @@ async def run() -> None:
 
     # done false is capped
     sleeps.clear(); clock[0] = 0.0
-    server._client, calls = make_client(["processing"])
     big_task = {"id": "t1", "type": "research", "status": "processing", "input": {"q": "q" * 100000, "outputType": "sourcedAnswer"}, "output": None, "error": None}
     server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=big_task)), base_url="https://mock/v1")
     r = await server.linkup_wait_research("t1", 20, 5000, None)
@@ -378,6 +377,68 @@ async def run() -> None:
     check(requests[0] == 1 and isinstance(text, str), f"valid arguments reach the client: {requests[0]} request")
     tools = await server.mcp.list_tools()
     check(all(t.inputSchema.get("additionalProperties") is False for t in tools), "every tool schema has additionalProperties false")
+
+    # Lone surrogates: the text is always valid UTF-8, and the size arithmetic stays exact
+    try:
+        lone = server._dumps({"a": "x\ud83dy"})
+        lone.encode("utf-8")
+        check(len(lone) == len(server._dumps({"a": "x?y"})), "_dumps replaces a lone surrogate one for one")
+    except UnicodeEncodeError:
+        check(False, "_dumps output encodes as UTF-8")
+    check(server._dumps({"a": "x\U0001F600y"}) == '{"a":"x\U0001F600y"}', "_dumps keeps a valid surrogate pair (emoji)")
+    bad_body = b'{"id":"t1","type":"research","status":"completed","output":{"answer":"bad \\ud83d end","sources":[]}}'
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=bad_body, headers={"content-type": "application/json"})), base_url="https://mock/v1")
+    text = first_text(await server.mcp.call_tool("linkup-get-research", {"id": "t1"}))
+    try:
+        text.encode("utf-8")
+        encodable = True
+    except UnicodeEncodeError:
+        encodable = False
+    check(encodable and "bad " in text and " end" in text, f"answer with a lone surrogate escape is sent as valid UTF-8: {text[:60]!r}")
+
+    # Task inputs: a snake_case key fails before any request
+    requests[0] = 0
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(counting_handler), base_url="https://mock/v1")
+    try:
+        await server.linkup_tasks_create([{"type": "fetch", "input": {"url": "https://example.com", "render_js": True}}], True, 5000)
+        check(False, "snake_case input key raises in a dry run")
+    except server.ToolError as exc:
+        check("render_js" in str(exc) and "(use renderJs)" in str(exc) and "No task was submitted." in str(exc), f"snake_case key rejected in a dry run: {exc}")
+    try:
+        await server.linkup_tasks_create([{"type": "research", "input": {"q": "x", "outputType": "sourcedAnswer", "reasoning_depth": "S"}}], False, 5000)
+        check(False, "snake_case input key raises on submit")
+    except server.ToolError as exc:
+        check("reasoning_depth" in str(exc) and "(use reasoningDepth)" in str(exc) and requests[0] == 0, f"snake_case key rejected on submit, {requests[0]} requests")
+    r = await server.linkup_tasks_create([{"type": "search", "input": {"q": "x", "depth": "fast", "outputType": "structured", "structuredOutputSchema": {"type": "object", "properties": {"company_name": {"type": "string"}}}}}], True, 5000)
+    check(r.get("dry_run") is True, "snake_case property names inside structuredOutputSchema pass")
+
+    # Error results stay under the smallest cap
+    huge_error = {"statusCode": 429, "error": {"code": "RATE", "message": "m" * 10000, "details": []}}
+    server._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(429, json=huge_error)), base_url="https://mock/v1")
+    try:
+        await server.linkup_get_research("t1", 5000)
+        check(False, "429 with a huge body raises")
+    except server.LinkupError as exc:
+        check(len(str(exc)) < 2000 and "429" in str(exc) and "balance" in str(exc), f"error text cut: {len(str(exc))} chars")
+
+    # None counts as no arguments
+    text = first_text(await server.mcp.call_tool("linkup-guide", None))
+    check(isinstance(text, str) and len(text) > 100, f"call_tool with None arguments: {len(text)} chars")
+
+    # A data list of tasks: the sources lists go before any answer is cut
+    tasks_page = {"result": {"data": [{"id": f"t{i}", "status": "completed", "output": {"answer": "a" * 300, "sources": [{"name": "n", "url": f"https://example.com/{j}", "snippet": "p" * 1000} for j in range(5)]}} for i in range(10)]}}
+    out = server._finish(copy.deepcopy(tasks_page), 8000)
+    outputs = [t["output"] for t in out["result"]["data"]]
+    check(size(out) <= 8000 and all(o["answer"] == "a" * 300 for o in outputs) and any(o.get("sources_omitted", 0) > 0 for o in outputs) and all(o.get("sources_omitted", 0) + len(o["sources"]) == 5 for o in outputs),
+          f"data list of tasks: sources pruned, answers whole, {size(out)} chars")
+
+    # A data dict with a long list: the list shrinks once the outer sources are gone
+    listing = {"result": {"data": {"items": [{"n": i, "v": "x" * 20} for i in range(300)], "summary": "s" * 500}, "sources": [{"name": f"n{i}", "url": f"https://example.com/{i}", "snippet": "p" * 300} for i in range(5)]}}
+    out = server._finish(copy.deepcopy(listing), 2500)
+    data = out["result"]["data"]
+    items = data["items"]
+    check(len(out["result"].get("sources", [])) == 0 and data.get("items_omitted", 0) + len(items) == 300 and items == listing["result"]["data"]["items"][:len(items)] and size(out) <= 2500,
+          f"data.items shrinks: {len(items)} kept, items_omitted={data.get('items_omitted')}, {size(out)} chars")
 
     # Texts use the tool parameter names
     check(not any(w in server.INSTRUCTIONS for w in ("renderJs", "outputType", "fromDate", "toDate", "includeDomains")), "INSTRUCTIONS name no camelCase parameters")

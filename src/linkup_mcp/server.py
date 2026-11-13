@@ -115,7 +115,7 @@ class _StrictFastMCP(FastMCP):
                     fix = "query"
                 items.append(f"{arg} (use {fix})" if fix != arg and fix in valid else arg)
             raise ToolError(f"Unknown argument(s) for {name}: {', '.join(items)}. Valid parameters: {', '.join(sorted(valid)) or 'none'}. No request was sent to Linkup.")
-        return await super().call_tool(name, arguments)
+        return await super().call_tool(name, arguments or {})
 
 
 mcp = _StrictFastMCP(
@@ -136,9 +136,21 @@ PAID = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=
 CREATES = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
 
 
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
 def _dumps(obj: Any) -> str:
-    """Serialise to compact JSON with non-ASCII characters kept. The tools send this text, and the size cap measures it."""
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    """Serialise to compact JSON with non-ASCII characters kept. The tools send this text, and the size cap measures it.
+
+    The text always encodes as UTF-8. A lone surrogate (for example from the escape \\ud83d in an
+    API answer) becomes U+FFFD, one character for one character, so the size stays exact.
+    """
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = _LONE_SURROGATE.sub("\ufffd", text)
+    return text
 
 
 def tool(**options: Any):
@@ -223,7 +235,7 @@ async def _request(method: str, path: str, *, json_body: Any = None, params: dic
             detail = resp.text[:2000]
         hint = STATUS_HINTS.get(resp.status_code, "")
         raise LinkupError(
-            f"Linkup HTTP {resp.status_code}. {hint} Response: {json.dumps(detail)[:3000]}",
+            f"Linkup HTTP {resp.status_code}. {hint} Response: {json.dumps(detail)[:1500]}",
             status=resp.status_code,
             transient=resp.status_code == 429 or resp.status_code >= 500,
         )
@@ -374,7 +386,7 @@ def _drop_trailing(container: dict[str, Any], key: str, keep: int, need: int) ->
 
     Adds the number of dropped items to container["<key>_omitted"]. The saving is calculated
     from the items, without a serialisation of the whole object: an item saves its JSON text
-    and one comma (the last item of the list has no comma to save), and a new counter costs
+    and one comma (the item without a comma is the one that is removed when the list becomes empty), and a new counter costs
     ,"<key>_omitted":<n>. Drops nothing when that saves nothing. Returns the number of
     characters saved and the dropped items.
     """
@@ -827,6 +839,10 @@ async def linkup_tasks_create(
         if not isinstance(t, dict) or t.get("type") not in TASK_TYPES or not isinstance(t.get("input"), dict):
             raise ToolError(f'tasks[{i}] must be {{"type": one of {TASK_TYPES}, "input": {{...}}}}.')
         inp = dict(t["input"])
+        for key in inp:
+            if "_" in str(key):
+                camel = re.sub(r"_+([^_])", lambda m: m.group(1).upper(), str(key))
+                raise ToolError(f"tasks[{i}] ({t['type']}) input has the key {key}. The API field names are camelCase (use {camel}). No task was submitted.")
         if t["type"] in ("search", "research") and isinstance(inp.get("structuredOutputSchema"), dict):
             inp["structuredOutputSchema"] = json.dumps(inp["structuredOutputSchema"])
         if t["type"] == "search":

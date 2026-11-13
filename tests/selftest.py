@@ -145,7 +145,7 @@ async def main(argv: list[str]) -> int:
             if first:
                 rid = first["id"]
                 r = await session.call_tool("linkup-get-research", {"id": rid, "max_chars": 3000})
-                print(f"linkup-get-research({rid[:8]}...): {'ERROR ' + text_of(r)[:200] if r.isError else 'ok, status=' + str(json.loads(text_of(r))['task'].get('status'))}")
+                print(f"linkup-get-research({rid[:8]}...): {'ERROR ' + text_of(r)[:200] if r.isError else 'ok, status=' + str((json.loads(text_of(r)).get('task') or {}).get('status'))}")
                 if r.isError:
                     failures += 1
                 r = await session.call_tool("linkup-wait-research", {"id": rid, "max_wait_seconds": 12, "max_chars": 3000})
@@ -157,7 +157,7 @@ async def main(argv: list[str]) -> int:
                     print(f"linkup-wait-research: ERROR {body[:200]}")
                     failures += 1
                 r = await session.call_tool("linkup-tasks-get", {"id": rid, "max_chars": 2000})
-                print(f"linkup-tasks-get(same id): {'ERROR ' + text_of(r)[:200] if r.isError else 'ok, type=' + str(json.loads(text_of(r))['task'].get('type'))}")
+                print(f"linkup-tasks-get(same id): {'ERROR ' + text_of(r)[:200] if r.isError else 'ok, type=' + str((json.loads(text_of(r)).get('task') or {}).get('type'))}")
                 if r.isError:
                     failures += 1
             else:

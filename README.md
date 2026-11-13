@@ -51,13 +51,13 @@ Behaviour worth knowing:
   trailing sources, results and images, then the answer or markdown, then trailing items of
   other lists. A `<list>_omitted` counter gives the number of dropped items. `_truncated`
   and `_hint` say when a cut happened. A research answer comes back byte-identical to the
-  API when the answer and the task envelope (a few hundred characters) fit in the cap. The
+  API when the answer and the task envelope (usually less than 1,000 characters) fit in the cap. The
   two create calls (`linkup-research`, `linkup-extract`), the balance and the guide have no
-  cap, because their responses are small.
+  cap. They return no results. The create calls return the task envelope with your own input.
 - Tool parameters are snake_case. A call with an unknown parameter name (for example
   `outputType`) fails with an error that names the valid parameters. No request is sent to
-  Linkup.
-- `linkup-list-research` and `linkup-tasks-list` return an `output_preview` per task;
+  Linkup. A snake_case key in an input object of `linkup-tasks-create` fails in the same way.
+- `linkup-list-research`, `linkup-list-extract` and `linkup-tasks-list` return an `output_preview` per task;
   `include_output: true` returns the full outputs.
 - Errors carry Linkup's status code, its error body, and a one-line hint (for example 429:
   rate limit or empty balance).
@@ -73,10 +73,11 @@ uvx linkup-mcp
 
 Claude Code, user scope. The key is stored in the `env` of the entry, not in its `args`.
 `read -rs` keeps the key out of the shell history. The key is on the command line of the
-`claude` process only while the command runs.
+`claude` process only while the command runs. The first command waits without a prompt.
+Paste the key, then press Enter. Nothing is shown.
 
 ```
-read -rs LINKUP_API_KEY   # paste the key, then press Enter; nothing is shown
+read -rs LINKUP_API_KEY
 claude mcp add-json --scope user linkup '{"type":"stdio","command":"uvx","args":["linkup-mcp"],"env":{"LINKUP_API_KEY":"'"$LINKUP_API_KEY"'"}}'
 unset LINKUP_API_KEY
 ```
