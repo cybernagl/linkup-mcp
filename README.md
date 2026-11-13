@@ -54,16 +54,24 @@ Behaviour worth knowing:
 
 ## Install
 
-With [uv](https://docs.astral.sh/uv/), no checkout needed:
+With [uv](https://docs.astral.sh/uv/), from [PyPI](https://pypi.org/project/linkup-mcp/),
+no checkout needed:
 
 ```
-uvx --from git+https://github.com/cybernagl/linkup-mcp linkup-mcp
+uvx linkup-mcp
 ```
 
 Claude Code, user scope (the key goes into the env of the entry, never on the command line):
 
 ```
-claude mcp add-json --scope user linkup '{"type":"stdio","command":"uvx","args":["--from","git+https://github.com/cybernagl/linkup-mcp","linkup-mcp"],"env":{"LINKUP_API_KEY":"<key>"}}'
+claude mcp add-json --scope user linkup '{"type":"stdio","command":"uvx","args":["linkup-mcp"],"env":{"LINKUP_API_KEY":"<key>"}}'
+```
+
+The current main branch instead of the release: replace `linkup-mcp` in `args` with
+`--from`, `git+https://github.com/cybernagl/linkup-mcp`, `linkup-mcp`, or run
+
+```
+uvx --from git+https://github.com/cybernagl/linkup-mcp linkup-mcp
 ```
 
 Any other MCP client: run `linkup-mcp` (or `python -m linkup_mcp`) over stdio with
@@ -88,7 +96,8 @@ uv venv && uv pip install -e .
 .venv/bin/python tests/selftest.py --paid # adds two fast searches and two fetches, about 0.014 USD
 ```
 
-The self-test never creates a research task (0.25 USD and up).
+The self-test never creates a research task (0.25 USD and up). GitHub Actions runs the
+offline tests and the protocol self-test on Python 3.11, 3.12 and 3.13 for every push.
 
 ## Claude Code Notes
 
