@@ -99,6 +99,23 @@ uv venv && uv pip install -e .
 The self-test never creates a research task (0.25 USD and up). GitHub Actions runs the
 offline tests and the protocol self-test on Python 3.11, 3.12 and 3.13 for every push.
 
+## Release
+
+Releases reach PyPI through [trusted publishing](https://docs.pypi.org/trusted-publishers/):
+GitHub Actions proves its identity to PyPI with an OIDC token, and PyPI mints a 15-minute
+upload token for this project. No API token is stored anywhere.
+
+1. Set the new version in `pyproject.toml` and commit it to main
+2. Tag that commit and push the tag: `git tag -a vX.Y.Z -m "linkup-mcp X.Y.Z" && git push origin vX.Y.Z`
+3. The Release workflow (`.github/workflows/release.yml`) checks that the tag matches the
+   version, runs the tests, builds wheel and sdist, and then waits in the `pypi` environment
+   for an approval on the Actions page. After the approval it uploads to PyPI
+
+The publisher registered on PyPI is repository `cybernagl/linkup-mcp`, workflow
+`release.yml`, environment `pypi`. The environment accepts `v*` tags only and requires a
+reviewer. A run that fails before the upload can be re-run or re-tagged at the same version;
+a version that reached PyPI cannot be replaced and needs a new version number.
+
 ## Claude Code Notes
 
 - Results above 50,000 characters (or `MAX_MCP_OUTPUT_TOKENS`, default 25,000 tokens) are

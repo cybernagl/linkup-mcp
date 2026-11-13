@@ -1,0 +1,71 @@
+name: Release
+
+# Publishes to PyPI through trusted publishing (OIDC): no API token anywhere.
+# Trigger: push a tag vX.Y.Z that matches the version in pyproject.toml.
+# The publish job runs in the "pypi" environment, which requires a manual approval
+# and accepts v* tags only.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches the package version
+        id: version
+        run: |
+          VERSION=$(uv version --short)
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match pyproject version $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install and test
+        run: |
+          uv venv --python 3.12
+          uv pip install -e .
+          .venv/bin/python tests/test_wait.py
+          .venv/bin/python tests/selftest.py
+
+      - name: Build wheel and sdist
+        run: |
+          uv build
+          uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/linkup-mcp/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.3
